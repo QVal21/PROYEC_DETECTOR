@@ -1,99 +1,133 @@
 # ─────────────────────────────────────────────
-#  alerter.py  —  Sistema de alertas
+#  alerter.py  —  Sistema de alertas (2 niveles)
 # ─────────────────────────────────────────────
 
 import time
 import threading
 import os
+import numpy as np
+import wave
 import config
 
 
 class Alerter:
     """
-    Maneja alertas sonoras con cooldown para evitar spam de audio.
-    Usa pygame si está disponible; si no, imprime en consola.
+    Nivel 1 → pitido corto y agudo (ojos cerrados por N frames)
+    Nivel 2 → sirena ascendente (ojos cerrados por 2 segundos)
     """
 
     def __init__(self):
-        self._last_alert_time = 0
+        self._last_l1 = 0
+        self._last_l2 = 0
+        self._last_yawn = 0
         self._pygame_ok = False
         self._lock = threading.Lock()
+
+        # Generar sonidos si no existen
+        os.makedirs("assets", exist_ok=True)
+        if not os.path.exists(config.ALERT_SOUND_LEVEL1):
+            self._gen_beep(config.ALERT_SOUND_LEVEL1, freq=1200, duration=0.4, style="beep")
+        if not os.path.exists(config.ALERT_SOUND_LEVEL2):
+            self._gen_beep(config.ALERT_SOUND_LEVEL2, freq=800,  duration=1.2, style="siren")
+        if not os.path.exists(config.ALERT_SOUND_YAWN):
+            self._gen_beep(config.ALERT_SOUND_YAWN,   freq=600,  duration=0.3, style="beep")
+
         self._init_audio()
 
+    # ── Init pygame ───────────────────────────
     def _init_audio(self):
-        """Intenta inicializar pygame para el audio."""
         try:
             import pygame
-            pygame.mixer.init()
-            if os.path.exists(config.ALERT_SOUND_PATH):
-                self._sound = pygame.mixer.Sound(config.ALERT_SOUND_PATH)
-                self._pygame_ok = True
-                print("[Alerter] Audio iniciado correctamente.")
-            else:
-                print(f"[Alerter] Archivo de audio no encontrado: {config.ALERT_SOUND_PATH}")
-                print("[Alerter] Continuando sin audio.")
-        except ImportError:
-            print("[Alerter] pygame no instalado. Alertas solo visuales.")
+            pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+            self._sounds = {
+                "level1": pygame.mixer.Sound(config.ALERT_SOUND_LEVEL1),
+                "level2": pygame.mixer.Sound(config.ALERT_SOUND_LEVEL2),
+                "yawn":   pygame.mixer.Sound(config.ALERT_SOUND_YAWN),
+            }
+            # Canales separados para que nivel2 no sea interrumpido por nivel1
+            self._ch_l1   = pygame.mixer.Channel(0)
+            self._ch_l2   = pygame.mixer.Channel(1)
+            self._ch_yawn = pygame.mixer.Channel(2)
+            self._pygame_ok = True
+            print("[Alerter] Audio iniciado correctamente.")
         except Exception as e:
-            print(f"[Alerter] Error al iniciar audio: {e}")
+            print(f"[Alerter] Sin audio: {e}")
 
-    def trigger(self, alert_type="drowsy"):
+    # ── Trigger público ───────────────────────
+    def trigger(self, alert_type: str):
         """
-        Dispara una alerta si ha pasado el cooldown.
-
-        Args:
-            alert_type: "drowsy" | "yawn"
+        alert_type: "level1" | "level2" | "yawn"
         """
         now = time.time()
         with self._lock:
-            if now - self._last_alert_time < config.ALERT_COOLDOWN_SEC:
-                return  # Aún en cooldown
-            self._last_alert_time = now
+            if alert_type == "level1":
+                if now - self._last_l1 < config.ALERT_COOLDOWN_L1:
+                    return
+                self._last_l1 = now
+            elif alert_type == "level2":
+                if now - self._last_l2 < config.ALERT_COOLDOWN_L2:
+                    return
+                self._last_l2 = now
+            elif alert_type == "yawn":
+                if now - self._last_yawn < 3:
+                    return
+                self._last_yawn = now
 
-        label = "¡SOMNOLENCIA!" if alert_type == "drowsy" else "¡BOSTEZO!"
-        print(f"\n[ALERTA] {label} — {time.strftime('%H:%M:%S')}")
+        labels = {"level1": "NIVEL 1 — Pitido", "level2": "NIVEL 2 — SIRENA", "yawn": "Bostezo"}
+        print(f"\n[ALERTA] {labels.get(alert_type, alert_type)} — {time.strftime('%H:%M:%S')}")
 
         if self._pygame_ok:
-            threading.Thread(target=self._play_sound, daemon=True).start()
+            threading.Thread(target=self._play, args=(alert_type,), daemon=True).start()
 
-    def _play_sound(self):
-        """Reproduce el sonido de alerta en un hilo separado."""
+    def stop_level2(self):
+        """Detiene la sirena del nivel 2 inmediatamente."""
+        if self._pygame_ok:
+            try:
+                self._ch_l2.stop()
+            except Exception:
+                pass
+
+    # ── Reproducción ──────────────────────────
+    def _play(self, alert_type):
         try:
-            self._sound.play()
-            time.sleep(self._sound.get_length())
+            if alert_type == "level1":
+                self._ch_l1.play(self._sounds["level1"])
+            elif alert_type == "level2":
+                self._ch_l2.play(self._sounds["level2"], loops=0)
+            elif alert_type == "yawn":
+                self._ch_yawn.play(self._sounds["yawn"])
         except Exception as e:
-            print(f"[Alerter] Error reproduciendo sonido: {e}")
+            print(f"[Alerter] Error reproduciendo {alert_type}: {e}")
 
-    def generate_beep_wav(self, path="assets/alert.wav"):
+    # ── Generador de WAV ──────────────────────
+    def _gen_beep(self, path, freq=880, duration=0.5, style="beep"):
         """
-        Genera un archivo WAV de beep simple usando numpy.
-        Útil si no tienes un archivo de audio propio.
+        Genera archivos WAV sintéticos.
+        style="beep"  → onda senoidal con fade out (pitido)
+        style="siren" → frecuencia que sube y baja (sirena)
         """
-        try:
-            import numpy as np
-            import wave, struct
+        sr = 44100
+        n  = int(sr * duration)
+        t  = np.linspace(0, duration, n, False)
 
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+        if style == "siren":
+            # Frecuencia oscila entre freq y freq*2
+            mod = freq + freq * np.abs(np.sin(2 * np.pi * 2.5 * t))
+            wave_data = np.sin(2 * np.pi * np.cumsum(mod) / sr)
+            # Envelope: sube rápido, mantiene, baja
+            env = np.ones(n)
+            ramp = int(sr * 0.05)
+            env[:ramp] = np.linspace(0, 1, ramp)
+            env[-ramp:] = np.linspace(1, 0, ramp)
+        else:
+            wave_data = np.sin(2 * np.pi * freq * t)
+            env = np.linspace(1.0, 0.0, n)
 
-            sample_rate = 44100
-            duration    = 0.8     # segundos
-            frequency   = 880     # Hz (La5)
-            num_samples = int(sample_rate * duration)
+        samples = (wave_data * env * 32767).astype(np.int16)
 
-            t = np.linspace(0, duration, num_samples, False)
-            # Onda sinusoidal con fade out
-            wave_data = np.sin(2 * np.pi * frequency * t)
-            fade = np.linspace(1.0, 0.0, num_samples)
-            wave_data = (wave_data * fade * 32767).astype(np.int16)
-
-            with wave.open(path, 'w') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                wf.writeframes(wave_data.tobytes())
-
-            print(f"[Alerter] Beep generado en: {path}")
-            return True
-        except Exception as e:
-            print(f"[Alerter] No se pudo generar beep: {e}")
-            return False
+        with wave.open(path, 'w') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(samples.tobytes())
+        print(f"[Alerter] Generado: {path}")

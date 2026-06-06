@@ -2,6 +2,7 @@
 #  detector.py  —  Lógica central de detección
 # ─────────────────────────────────────────────
 
+import time
 import cv2
 import mediapipe as mp
 
@@ -18,15 +19,11 @@ from utils import (
 
 class DrowsinessDetector:
     """
-    Detecta somnolencia y bostezos usando landmarks faciales de MediaPipe.
-
-    Métricas:
-      - EAR (Eye Aspect Ratio)  → ojos cerrados
-      - MAR (Mouth Aspect Ratio) → bostezos
+    Nivel 1 — ojos cerrados por EAR_CONSEC_FRAMES frames  → pitido
+    Nivel 2 — ojos cerrados por EAR_SECONDS_LEVEL2 segundos → sirena
     """
 
     def __init__(self):
-        # ── MediaPipe Face Mesh ───────────────────
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             max_num_faces=1,
@@ -35,85 +32,92 @@ class DrowsinessDetector:
             min_tracking_confidence=0.5,
         )
 
-        # ── Contadores de frames ──────────────────
-        self.ear_counter  = 0   # Frames consecutivos con ojos cerrados
-        self.mar_counter  = 0   # Frames consecutivos con boca abierta
+        # ── Contadores ────────────────────────
+        self.ear_counter = 0
+        self.mar_counter = 0
 
-        # ── Flags de alerta ───────────────────────
+        # ── Nivel 2: tiempo ───────────────────
+        self._eyes_closed_since = None   # timestamp cuando empezaron a cerrarse
+        self.level2_active = False       # sirena activa
+
+        # ── Flags nivel 1 ─────────────────────
         self.drowsy_alert = False
         self.yawn_alert   = False
 
-        # ── Estadísticas de sesión ────────────────
-        self.total_drowsy_events = 0
-        self.total_yawn_events   = 0
-        self.frames_processed    = 0
+        # ── Estadísticas ──────────────────────
+        self.total_l1_events   = 0
+        self.total_l2_events   = 0
+        self.total_yawn_events = 0
+        self.frames_processed  = 0
 
-    # ─────────────────────────────────────────────
+    # ─────────────────────────────────────────
     def process_frame(self, frame):
-        """
-        Procesa un frame y retorna el frame anotado + estado del conductor.
-
-        Args:
-            frame: imagen BGR de OpenCV
-
-        Returns:
-            annotated_frame : frame con anotaciones visuales
-            status          : dict con métricas y alertas
-        """
         self.frames_processed += 1
         h, w = frame.shape[:2]
 
-        # Estado por defecto
         status = {
             "face_detected": False,
             "ear": 0.0,
             "mar": 0.0,
-            "drowsy": False,
+            "alert_level": 0,   # 0=nada, 1=pitido, 2=sirena
             "yawning": False,
             "ear_counter": self.ear_counter,
-            "mar_counter": self.mar_counter,
+            "eyes_closed_seconds": 0.0,
         }
 
-        # Convertir a RGB para MediaPipe
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         results = self.face_mesh.process(rgb)
         rgb.flags.writeable = True
 
         if not results.multi_face_landmarks:
-            draw_overlay(frame, "Sin rostro detectado", (10, 30),
-                         config.COLOR_WARNING)
+            draw_overlay(frame, "Sin rostro detectado", (10, 30), config.COLOR_WARNING)
+            self._reset_eye_timers()
             return frame, status
 
-        # ── Landmarks del primer rostro ───────────
         lm = results.multi_face_landmarks[0].landmark
         status["face_detected"] = True
 
-        # ── Calcular EAR ──────────────────────────
-        ear_left  = eye_aspect_ratio(lm, config.LEFT_EYE,  w, h)
-        ear_right = eye_aspect_ratio(lm, config.RIGHT_EYE, w, h)
-        ear = (ear_left + ear_right) / 2.0
+        # ── EAR ───────────────────────────────
+        ear_l = eye_aspect_ratio(lm, config.LEFT_EYE,  w, h)
+        ear_r = eye_aspect_ratio(lm, config.RIGHT_EYE, w, h)
+        ear   = (ear_l + ear_r) / 2.0
         status["ear"] = ear
 
-        # ── Calcular MAR ──────────────────────────
+        # ── MAR ───────────────────────────────
         mar = mouth_aspect_ratio(lm, config.MOUTH, w, h)
         status["mar"] = mar
 
-        # ── Lógica de contadores ──────────────────
-        # EAR
+        # ── Lógica EAR ────────────────────────
         if ear < config.EAR_THRESHOLD:
             self.ear_counter += 1
+
+            # Nivel 2: cronometrar tiempo con ojos cerrados
+            if self._eyes_closed_since is None:
+                self._eyes_closed_since = time.time()
+
+            closed_secs = time.time() - self._eyes_closed_since
+            status["eyes_closed_seconds"] = closed_secs
+
+            # NIVEL 2 (prioridad)
+            if closed_secs >= config.EAR_SECONDS_LEVEL2:
+                if not self.level2_active:
+                    self.total_l2_events += 1
+                    self.level2_active = True
+                status["alert_level"] = 2
+
+            # NIVEL 1
+            elif self.ear_counter >= config.EAR_CONSEC_FRAMES:
+                if not self.drowsy_alert:
+                    self.total_l1_events += 1
+                    self.drowsy_alert = True
+                status["alert_level"] = 1
+
         else:
-            self.ear_counter = 0
-            self.drowsy_alert = False
+            # Ojos abiertos → resetear todo
+            self._reset_eye_timers()
 
-        if self.ear_counter >= config.EAR_CONSEC_FRAMES:
-            if not self.drowsy_alert:
-                self.total_drowsy_events += 1
-                self.drowsy_alert = True
-            status["drowsy"] = True
-
-        # MAR
+        # ── Lógica MAR ────────────────────────
         if mar > config.MAR_THRESHOLD:
             self.mar_counter += 1
         else:
@@ -127,77 +131,101 @@ class DrowsinessDetector:
             status["yawning"] = True
 
         status["ear_counter"] = self.ear_counter
-        status["mar_counter"] = self.mar_counter
 
-        # ── Dibujar contornos ─────────────────────
-        eye_color = config.COLOR_DANGER if status["drowsy"] else config.COLOR_OK
+        # ── Dibujar ───────────────────────────
+        if status["alert_level"] == 2:
+            eye_color = config.COLOR_CRITICAL
+        elif status["alert_level"] == 1:
+            eye_color = config.COLOR_DANGER
+        else:
+            eye_color = config.COLOR_OK
+
         mouth_color = config.COLOR_WARNING if status["yawning"] else config.COLOR_OK
 
         draw_eye_contour(frame, lm, config.LEFT_EYE,  w, h, eye_color)
         draw_eye_contour(frame, lm, config.RIGHT_EYE, w, h, eye_color)
         draw_mouth_contour(frame, lm, config.MOUTH,   w, h, mouth_color)
 
-        # ── Barras de métricas ────────────────────
         draw_metric_bar(frame, ear, config.EAR_THRESHOLD, "EAR", 10, 50)
-        draw_metric_bar(frame, mar, config.MAR_THRESHOLD, "MAR", 10, 85)
+        draw_metric_bar(frame, mar, config.MAR_THRESHOLD, "MAR", 10, 90)
 
-        # ── Panel de estadísticas ─────────────────
         self._draw_stats_panel(frame, status)
-
-        # ── Alertas visuales ──────────────────────
-        if status["drowsy"]:
-            self._draw_alert_banner(frame, "SOMNOLENCIA DETECTADA!", config.COLOR_DANGER)
-        elif status["yawning"]:
-            self._draw_alert_banner(frame, "BOSTEZO DETECTADO", config.COLOR_WARNING)
+        self._draw_alert_banner(frame, status)
 
         return frame, status
 
-    # ─────────────────────────────────────────────
-    def _draw_stats_panel(self, frame, status):
-        """Panel semitransparente con estadísticas en tiempo real."""
-        h, w = frame.shape[:2]
-        panel_x, panel_y = w - 220, 10
-        panel_w, panel_h = 210, 110
+    # ── Reset timers ──────────────────────────
+    def _reset_eye_timers(self):
+        self.ear_counter = 0
+        self._eyes_closed_since = None
+        self.drowsy_alert = False
+        if self.level2_active:
+            self.level2_active = False   # señal para que main detenga sirena
 
-        # Fondo semitransparente
+    def reset_level2(self):
+        """Llamado desde main cuando el usuario presiona 's'."""
+        self.level2_active = False
+        self._eyes_closed_since = None
+
+    # ── Panels ────────────────────────────────
+    def _draw_stats_panel(self, frame, status):
+        h, w = frame.shape[:2]
+        px, py, pw, ph = w - 230, 10, 220, 125
         overlay = frame.copy()
-        cv2.rectangle(overlay, (panel_x, panel_y),
-                      (panel_x + panel_w, panel_y + panel_h),
-                      (20, 20, 20), -1)
+        cv2.rectangle(overlay, (px, py), (px + pw, py + ph), (20, 20, 20), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
+        secs = f"{status['eyes_closed_seconds']:.1f}s" if status['eyes_closed_seconds'] > 0 else "--"
         lines = [
-            f"Eventos somnolencia: {self.total_drowsy_events}",
+            f"Nivel 1 (pitido): {self.total_l1_events}",
+            f"Nivel 2 (sirena): {self.total_l2_events}",
             f"Bostezos: {self.total_yawn_events}",
-            f"Frames: {self.frames_processed}",
             f"EAR frames: {self.ear_counter}/{config.EAR_CONSEC_FRAMES}",
-            f"MAR frames: {self.mar_counter}/{config.MAR_CONSEC_FRAMES}",
+            f"Ojos cerrados: {secs} / {config.EAR_SECONDS_LEVEL2}s",
+            f"Frames: {self.frames_processed}",
         ]
         for i, line in enumerate(lines):
-            cv2.putText(frame, line,
-                        (panel_x + 6, panel_y + 20 + i * 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                        config.COLOR_WHITE, 1)
+            cv2.putText(frame, line, (px + 6, py + 18 + i * 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, config.COLOR_WHITE, 1)
 
-    def _draw_alert_banner(self, frame, message, color):
-        """Banner de alerta en la parte superior del frame."""
+    def _draw_alert_banner(self, frame, status):
         h, w = frame.shape[:2]
+        level = status["alert_level"]
+
+        if level == 2:
+            color   = config.COLOR_CRITICAL
+            message = "⚠  NIVEL 2 — PELIGRO: OJOS CERRADOS 2s"
+        elif level == 1:
+            color   = config.COLOR_DANGER
+            message = "NIVEL 1 — SOMNOLENCIA DETECTADA"
+        elif status["yawning"]:
+            color   = config.COLOR_WARNING
+            message = "BOSTEZO DETECTADO"
+        else:
+            return
+
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (w, 50), color, -1)
-        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-        text_size = cv2.getTextSize(message, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2)[0]
-        text_x = (w - text_size[0]) // 2
-        cv2.putText(frame, message, (text_x, 33),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.9, config.COLOR_WHITE, 2)
+        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+        ts = cv2.getTextSize(message, cv2.FONT_HERSHEY_DUPLEX, 0.85, 2)[0]
+        cv2.putText(frame, message, ((w - ts[0]) // 2, 33),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.85, config.COLOR_WHITE, 2)
+
+        # Barra de progreso nivel 2
+        if level >= 1 and self._eyes_closed_since:
+            secs    = time.time() - self._eyes_closed_since
+            ratio   = min(secs / config.EAR_SECONDS_LEVEL2, 1.0)
+            bar_w   = int(w * ratio)
+            bar_col = config.COLOR_CRITICAL if ratio >= 1.0 else config.COLOR_DANGER
+            cv2.rectangle(frame, (0, 48), (bar_w, 54), bar_col, -1)
 
     def get_session_summary(self):
-        """Retorna un resumen de la sesión de detección."""
         return {
-            "frames_procesados": self.frames_processed,
-            "eventos_somnolencia": self.total_drowsy_events,
-            "bostezos": self.total_yawn_events,
+            "frames_procesados":    self.frames_processed,
+            "eventos_nivel1":       self.total_l1_events,
+            "eventos_nivel2":       self.total_l2_events,
+            "bostezos":             self.total_yawn_events,
         }
 
     def release(self):
-        """Libera recursos de MediaPipe."""
         self.face_mesh.close()
